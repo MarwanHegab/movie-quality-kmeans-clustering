@@ -1,0 +1,569 @@
+---
+title: "Movie Dataset: A K-Means Clustering Analysis"
+author: "Shreyes Balaji, Marwan Hegab, Mazin Hussein, Mikael Rotberg, Roberto Rubio, Jordan Woda"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5,
+  fig.align = "center"
+)
+```
+
+# 1. Purpose of this report
+
+This report applies K-means clustering to the TMDB 5000 Movie Dataset to
+group movies into interpretable clusters based on financial and audience
+metrics, then evaluates how well the cluster structure generalizes to a
+held-out test set.
+
+# 2. Load packages
+
+```{r packages}
+needed_packages <- c(
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "readr",
+  "cluster",
+  "factoextra",
+  "GGally",
+  "knitr",
+  "scales",
+  "pdist"
+)
+
+installed <- rownames(installed.packages())
+for (p in needed_packages) {
+  if (!(p %in% installed)) install.packages(p)
+}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(cluster)
+library(factoextra)
+library(GGally)
+library(knitr)
+library(scales)
+library(pdist)
+```
+
+# 3. Read and merge the datasets
+
+```{r read-data}
+movies_raw  <- read_csv("data/tmdb_5000_movies.csv", show_col_types = FALSE)
+credits_raw <- read_csv("data/tmdb_5000_credits.csv", show_col_types = FALSE)
+
+credits_small <- credits_raw %>%
+  select(movie_id, title, cast, crew) %>%
+  rename(id = movie_id)
+
+tmdb_raw <- movies_raw %>%
+  inner_join(credits_small, by = "id", suffix = c("", "_credits"))
+
+dim(movies_raw)
+dim(credits_raw)
+dim(tmdb_raw)
+
+head(tmdb_raw[, c("title", "budget", "revenue", "runtime",
+                  "popularity", "vote_average", "vote_count")])
+str(tmdb_raw)
+summary(tmdb_raw[, c("budget", "revenue", "runtime",
+                      "popularity", "vote_average", "vote_count")])
+```
+
+## 3.1 Variable descriptions
+
+```{r variable-descriptions}
+variable_info <- tibble::tibble(
+  variable = c(
+    "budget", "revenue", "runtime", "popularity",
+    "vote_average", "vote_count"
+  ),
+  description = c(
+    "Production budget of the movie in US dollars",
+    "Worldwide revenue of the movie in US dollars",
+    "Runtime of the movie in minutes",
+    "TMDB popularity score (higher = more page views / interactions)",
+    "Average user rating (0 to 10 scale)",
+    "Number of user votes the movie received"
+  )
+)
+kable(variable_info, caption = "Variable descriptions for the TMDB numeric feature set")
+```
+
+## 3.2 Data quality checks
+
+```{r data-quality-checks}
+raw_n <- nrow(tmdb_raw)
+raw_p <- ncol(tmdb_raw)
+
+na_counts <- colSums(is.na(tmdb_raw[, c("budget", "revenue", "runtime",
+                                          "popularity", "vote_average",
+                                          "vote_count")]))
+
+duplicate_count <- sum(duplicated(tmdb_raw$id))
+
+quality_checks <- data.frame(
+  item = c("Number of rows", "Number of columns", "Duplicated movie IDs"),
+  value = c(raw_n, raw_p, duplicate_count)
+)
+kable(quality_checks, caption = "Basic data quality checks")
+kable(
+  data.frame(variable = names(na_counts),
+             missing_count = as.integer(na_counts)),
+  caption = "Missing values for numeric clustering variables"
+)
+```
+
+## 3.3 Treat zero budget/revenue/runtime as missing
+
+Many TMDB rows store unknown financial values as `0` instead of `NA`,
+which would distort distance-based clustering. These are recoded as
+missing here.
+
+```{r zero-as-na}
+tmdb_raw <- tmdb_raw %>%
+  mutate(
+    budget = ifelse(budget == 0, NA, budget),
+    revenue = ifelse(revenue == 0, NA, revenue),
+    runtime = ifelse(runtime == 0, NA, runtime)
+  )
+
+zero_na_report <- tmdb_raw %>%
+  summarise(
+    missing_budget = sum(is.na(budget)),
+    missing_revenue = sum(is.na(revenue)),
+    missing_runtime = sum(is.na(runtime))
+  )
+kable(zero_na_report, caption = "Missing counts after recoding zero values as NA")
+```
+
+# 4. Raw-data visualizations
+
+## 4.1 Histograms of numeric variables
+
+```{r raw-histograms, fig.height=8}
+num_vars <- c("budget", "revenue", "runtime",
+              "popularity", "vote_average", "vote_count")
+
+tmdb_long_hist <- tmdb_raw %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+ggplot(tmdb_long_hist, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Histograms of numeric variables (raw TMDB data)",
+    x = NULL, y = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 4.2 Correlation heatmap for numeric variables
+
+```{r raw-correlation-heatmap}
+numeric_raw <- tmdb_raw %>%
+  select(all_of(num_vars)) %>%
+  drop_na()
+
+corr_mat <- cor(numeric_raw)
+corr_df <- as.data.frame(as.table(corr_mat))
+names(corr_df) <- c("Var1", "Var2", "Correlation")
+
+ggplot(corr_df, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(Correlation, 2)), color = "black", size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white",
+                       high = "navy", midpoint = 0) +
+  labs(title = "Correlation heatmap of numeric variables",
+       x = NULL, y = NULL, fill = "Corr") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 4.3 Boxplots before cleaning
+
+```{r raw-boxplots, fig.height=8}
+ggplot(tmdb_long_hist, aes(x = "", y = value)) +
+  geom_boxplot(fill = "tan") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Boxplots before cleaning", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+# 5. Clean the data
+
+Cleaning steps used here:
+
+1. Keep only the numeric clustering variables plus `title`
+2. Remove rows with missing values (including recoded zeros)
+3. Remove duplicate movie IDs
+4. Use Tukey's IQR rule on the numeric predictor variables to detect
+   and remove outliers
+
+## 5.1 Subset and remove missing values
+
+```{r clean-na-duplicates}
+tmdb_step1 <- tmdb_raw %>%
+  select(id, title, all_of(num_vars)) %>%
+  drop_na()
+
+n_after_na <- nrow(tmdb_step1)
+
+tmdb_step2 <- tmdb_step1 %>% distinct(id, .keep_all = TRUE)
+n_after_dups <- nrow(tmdb_step2)
+
+cleaning_counts_1 <- data.frame(
+  step = c("Raw data", "After removing NAs", "After removing duplicates"),
+  rows = c(nrow(tmdb_raw), n_after_na, n_after_dups)
+)
+kable(cleaning_counts_1, caption = "Rows remaining after NA and duplicate removal")
+```
+
+## 5.2 Detect outliers using Tukey's IQR rule
+
+```{r outlier-detection}
+iqr_outlier_flag <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+  x < lower | x > upper
+}
+
+outlier_matrix <- sapply(tmdb_step2[, num_vars], iqr_outlier_flag)
+outlier_rows <- apply(outlier_matrix, 1, any)
+
+tmdb_clean <- tmdb_step2[!outlier_rows, ]
+n_after_outliers <- nrow(tmdb_clean)
+
+cleaning_counts_2 <- data.frame(
+  step = c("After removing duplicates", "Rows flagged as outliers",
+           "Final cleaned data"),
+  rows = c(nrow(tmdb_step2), sum(outlier_rows), n_after_outliers)
+)
+kable(cleaning_counts_2, caption = "Rows removed by IQR-based outlier cleaning")
+```
+
+## 5.3 Final cleaned dataset checks
+
+```{r cleaned-checks}
+dim(tmdb_clean)
+summary(tmdb_clean[, num_vars])
+```
+
+## 5.4 Boxplots after cleaning
+
+```{r clean-boxplots, fig.height=8}
+tmdb_long_box_after <- tmdb_clean %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+ggplot(tmdb_long_box_after, aes(x = "", y = value)) +
+  geom_boxplot(fill = "lightgreen") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Boxplots after cleaning", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+# 6. Train-test split
+
+K-means is unsupervised, but the rubric requires a train/test split.
+The model is fitted on the training set, and the test set is used to
+assign clusters to unseen movies (prediction / evaluation).
+
+```{r split-data}
+set.seed(123)
+
+tmdb_features <- tmdb_clean %>% select(all_of(num_vars))
+
+train_index <- sample(seq_len(nrow(tmdb_clean)),
+                       size = floor(0.70 * nrow(tmdb_clean)))
+
+train_data <- tmdb_clean[train_index, ]
+test_data  <- tmdb_clean[-train_index, ]
+
+split_summary <- data.frame(
+  dataset = c("Train", "Test"),
+  rows = c(nrow(train_data), nrow(test_data)),
+  proportion = c(nrow(train_data) / nrow(tmdb_clean),
+                 nrow(test_data)  / nrow(tmdb_clean))
+)
+kable(split_summary, digits = 3, caption = "Train-test split sizes")
+```
+
+## 6.1 Standardize the features
+
+K-means is distance based, so all numeric predictors are standardized
+using means and standard deviations from the **training set** only,
+then applied to the test set.
+
+```{r scale-features}
+train_x <- train_data %>% select(all_of(num_vars))
+test_x  <- test_data  %>% select(all_of(num_vars))
+
+train_means <- colMeans(train_x)
+train_sds   <- apply(train_x, 2, sd)
+
+train_x_scaled <- scale(train_x, center = train_means, scale = train_sds)
+test_x_scaled  <- scale(test_x,  center = train_means, scale = train_sds)
+
+dim(train_x_scaled)
+dim(test_x_scaled)
+```
+
+## 6.2 Diagonal (pairs) plot to verify assumptions
+
+The pairs / diagonal plot shows the univariate distributions and
+pairwise scatterplots of the scaled training features. This is used
+to check that the variables are reasonably continuous, to inspect
+linear vs. nonlinear pairwise structure, and to look for any
+remaining extreme points that could dominate Euclidean distances.
+
+```{r diagonal-plot, fig.height=8, fig.width=9}
+set.seed(123)
+pairs_sample <- as.data.frame(train_x_scaled) %>%
+  slice_sample(n = min(500, nrow(train_x_scaled)))
+
+ggpairs(pairs_sample,
+        title = "Diagonal plot of standardized training features") +
+  theme_minimal()
+```
+
+# 7. Analysis: Choosing the number of clusters K
+
+## 7.1 Elbow method (within-cluster sum of squares)
+
+```{r elbow-plot}
+set.seed(123)
+fviz_nbclust(train_x_scaled, kmeans, method = "wss", k.max = 10) +
+  labs(title = "Elbow method for optimal K (training set)",
+       x = "Number of clusters K",
+       y = "Total within-cluster sum of squares") +
+  theme_minimal()
+```
+
+## 7.2 Silhouette method
+
+```{r silhouette-plot}
+set.seed(123)
+fviz_nbclust(train_x_scaled, kmeans, method = "silhouette", k.max = 10) +
+  labs(title = "Silhouette method for optimal K (training set)",
+       x = "Number of clusters K",
+       y = "Average silhouette width") +
+  theme_minimal()
+```
+
+## 7.3 Gap statistic (optional confirmation)
+
+```{r gap-plot}
+set.seed(123)
+gap_stat <- clusGap(train_x_scaled, FUN = kmeans, nstart = 25,
+                     K.max = 10, B = 50)
+fviz_gap_stat(gap_stat) +
+  labs(title = "Gap statistic for optimal K (training set)") +
+  theme_minimal()
+```
+
+# 8. Fit the final K-means model
+
+The chosen K is set from the elbow and silhouette diagnostics.
+Update `final_k` below if a different value is preferred after
+inspecting the plots.
+
+```{r kmeans-fit}
+final_k <- 4
+
+set.seed(123)
+km_final <- kmeans(train_x_scaled, centers = final_k,
+                    nstart = 25, iter.max = 100)
+
+km_final$size
+km_final$centers
+km_final$tot.withinss
+km_final$betweenss / km_final$totss
+```
+
+## 8.1 Cluster visualization on the first two principal components
+
+```{r cluster-viz}
+fviz_cluster(km_final,
+             data = train_x_scaled,
+             geom = "point",
+             ellipse.type = "convex",
+             ggtheme = theme_minimal()) +
+  labs(title = paste0("K-means cluster plot on training data (K = ",
+                       final_k, ")"))
+```
+
+## 8.2 Cluster profiles on the original scale
+
+The centers are transformed back from standardized units to the
+original scale so the clusters can be interpreted in human-readable
+units (dollars, minutes, rating points, etc.).
+
+```{r cluster-profiles}
+centers_orig <- sweep(km_final$centers, 2, train_sds, `*`)
+centers_orig <- sweep(centers_orig,      2, train_means, `+`)
+
+centers_orig_df <- as.data.frame(centers_orig) %>%
+  mutate(cluster = factor(1:final_k),
+         size = km_final$size) %>%
+  relocate(cluster, size)
+
+kable(centers_orig_df, digits = 2,
+      caption = "Cluster centers on the original scale (training set)")
+```
+
+## 8.3 Cluster sizes
+
+```{r cluster-sizes}
+size_df <- data.frame(
+  cluster = factor(1:final_k),
+  size = km_final$size
+)
+
+ggplot(size_df, aes(x = cluster, y = size, fill = cluster)) +
+  geom_col() +
+  geom_text(aes(label = size), vjust = -0.3) +
+  labs(title = "Training-set cluster sizes",
+       x = "Cluster", y = "Number of movies") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# 9. Model evaluation and prediction on the test set
+
+## 9.1 Assign each test movie to its nearest training cluster
+
+```{r predict-test}
+predict_kmeans <- function(centers, newdata) {
+  dist_mat <- as.matrix(
+    pdist::pdist(X = as.matrix(newdata), Y = as.matrix(centers))
+  )
+  apply(dist_mat, 1, which.min)
+}
+
+test_clusters  <- predict_kmeans(km_final$centers, test_x_scaled)
+train_clusters <- km_final$cluster
+```
+
+## 9.2 Test-set cluster sizes and stability
+
+```{r test-cluster-sizes}
+train_tbl <- prop.table(table(train_clusters))
+test_tbl  <- prop.table(table(test_clusters))
+
+stability_df <- data.frame(
+  cluster = factor(1:final_k),
+  train_proportion = as.numeric(train_tbl),
+  test_proportion  = as.numeric(test_tbl)
+)
+
+kable(stability_df, digits = 3,
+      caption = "Cluster proportions on the training and test sets")
+
+stability_long <- stability_df %>%
+  pivot_longer(cols = c(train_proportion, test_proportion),
+               names_to = "set", values_to = "proportion")
+
+ggplot(stability_long, aes(x = cluster, y = proportion, fill = set)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Cluster proportions: train vs test",
+       x = "Cluster", y = "Proportion") +
+  theme_minimal()
+```
+
+## 9.3 Silhouette analysis on the test set
+
+```{r silhouette-test}
+test_dist <- dist(test_x_scaled)
+sil_test  <- silhouette(test_clusters, test_dist)
+
+summary(sil_test)[["avg.width"]]
+
+fviz_silhouette(sil_test) +
+  labs(title = "Silhouette plot on the test set") +
+  theme_minimal()
+```
+
+## 9.4 Test-set cluster profile on the original scale
+
+```{r test-cluster-profile}
+test_with_cluster <- test_data %>%
+  mutate(cluster = factor(test_clusters))
+
+test_profile <- test_with_cluster %>%
+  group_by(cluster) %>%
+  summarise(across(all_of(num_vars), mean), .groups = "drop") %>%
+  mutate(size = as.integer(table(test_clusters)))
+
+kable(test_profile, digits = 2,
+      caption = "Test-set cluster means on the original scale")
+```
+
+## 9.5 Example movies from each cluster
+
+```{r example-movies}
+example_movies <- test_with_cluster %>%
+  group_by(cluster) %>%
+  slice_max(order_by = popularity, n = 5) %>%
+  select(cluster, title, budget, revenue, runtime,
+         popularity, vote_average, vote_count) %>%
+  arrange(cluster)
+
+kable(example_movies, digits = 2,
+      caption = "Most popular movies in each test-set cluster")
+```
+
+# 10. Summary
+
+```{r auto-summary}
+cat("RAW DATA SUMMARY\n")
+cat("----------------\n")
+cat("Rows in movies data:     ", nrow(movies_raw), "\n")
+cat("Rows in credits data:    ", nrow(credits_raw), "\n")
+cat("Rows in merged raw data: ", nrow(tmdb_raw),    "\n\n")
+
+cat("CLEANING SUMMARY\n")
+cat("----------------\n")
+cat("Rows after removing missing values:", n_after_na,       "\n")
+cat("Rows after removing duplicates:    ", n_after_dups,      "\n")
+cat("Rows flagged as outliers:          ", sum(outlier_rows), "\n")
+cat("Rows in final cleaned dataset:     ", n_after_outliers,  "\n\n")
+
+cat("SPLIT SUMMARY\n")
+cat("-------------\n")
+cat("Train rows:", nrow(train_data), "\n")
+cat("Test rows: ", nrow(test_data),  "\n\n")
+
+cat("MODEL SUMMARY\n")
+cat("-------------\n")
+cat("Final K chosen:                   ", final_k, "\n")
+cat("Total within-cluster SS (train):  ",
+    round(km_final$tot.withinss, 2), "\n")
+cat("Between / total SS ratio (train): ",
+    round(km_final$betweenss / km_final$totss, 4), "\n")
+cat("Average silhouette on test set:   ",
+    round(summary(sil_test)[["avg.width"]], 4), "\n")
+```
