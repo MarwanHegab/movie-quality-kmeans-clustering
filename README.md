@@ -1,6 +1,6 @@
 # Movie Dataset: A K-Means Clustering Analysis
 
-Team project for Math 456 (Mathematical Modeling). We use K-means clustering
+We use K-means clustering
 to partition movies from the [TMDB 5000 Movie Dataset](https://www.kaggle.com/datasets/tmdb/tmdb-movie-metadata)
 (Kaggle) into interpretable groups based on six numeric features: budget,
 revenue, runtime, popularity, average rating, and vote count.
